@@ -160,7 +160,7 @@ app.post('/start/:project', (req, res) => {
         });
     }
 
-    const { path: projectPath, command } = config.projects[project];
+    const { path: projectPath, command, nodeVersion } = config.projects[project];
     
     const child = exec(`node start-project.js ${project}`, {
         maxBuffer: 1024 * 1024 // 增加缓冲区大小
