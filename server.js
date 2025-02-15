@@ -6,6 +6,8 @@ const path = require('path');
 const helmet = require('helmet');
 const config = require('./config');
 const os = require('os');
+const fs = require('fs');
+const WebSocket = require('ws');
 
 // 获取本机IP地址
 function getLocalIP() {
@@ -70,77 +72,53 @@ app.get('/api/projects', (req, res) => {
 // 存储运行中的项目进程和地址
 const runningProcesses = new Map();
 const projectUrls = new Map();
+const statusFilePath = path.join(process.cwd(), 'server_status.json');
 
-// 停止项目
-function stopProject(project) {
-    const process = runningProcesses.get(project);
-    if (process) {
-        try {
-            // 在 Windows 上，我们需要终止整个进程树
-            exec(`taskkill /F /T /PID ${process.pid}`, (error) => {
-                if (error) {
-                } else {
-                    // 确保清理资源
-                    runningProcesses.delete(project);
-                    projectUrls.delete(project);
-                }
+// 从状态文件加载状态
+function loadProjectStatus() {
+    try {
+        if (fs.existsSync(statusFilePath)) {
+            const status = JSON.parse(fs.readFileSync(statusFilePath, 'utf8'));
+            Object.entries(status).forEach(([project, data]) => {
+                projectUrls.set(project, data.urls);
             });
-            return true;
-        } catch (error) {
-            // 即使出错也尝试清理资源
-            runningProcesses.delete(project);
-            projectUrls.delete(project);
-            return false;
         }
+    } catch (error) {
+        console.error('Failed to load project status:', error);
     }
-    return false;
 }
 
-// 停止所有运行中的项目
-function stopAllProjects() {
-    const projects = Array.from(runningProcesses.keys());
-    projects.forEach(project => {
-        try {
-            stopProject(project);
-        } catch (error) {
-        }
+// 保存状态到文件
+function saveProjectStatus() {
+    try {
+        const status = {};
+        projectUrls.forEach((urls, project) => {
+            status[project] = {
+                urls,
+                running: runningProcesses.has(project)
+            };
+        });
+        fs.writeFileSync(statusFilePath, JSON.stringify(status, null, 2));
+    } catch (error) {
+        console.error('Failed to save project status:', error);
+    }
+}
+
+// 启动项目
+function startProjectProcess(project, command, cwd) {
+    const child = exec(command, {
+        cwd,
+        env: { ...process.env, FORCE_COLOR: true },
+        detached: true, // 使子进程独立运行
+        stdio: 'ignore' // 忽略标准输入输出
     });
-}
-
-// 在服务器关闭时停止所有项目
-process.on('SIGINT', () => {
-    stopAllProjects();
-    process.exit(0);  // 直接退出，不等待
-});
-
-process.on('SIGTERM', () => {
-    stopAllProjects();
-    process.exit(0);  // 直接退出，不等待
-});
-
-// 项目停止路由
-app.post('/stop/:project', (req, res) => {
-    const { project } = req.params;
     
-    if (!config.projects[project]) {
-        return res.status(400).json({
-            status: 'error',
-            message: 'Invalid project name'
-        });
-    }
-
-    if (stopProject(project)) {
-        res.json({
-            status: 'success',
-            message: 'Project stopped successfully'
-        });
-    } else {
-        res.status(404).json({
-            status: 'error',
-            message: 'Project is not running'
-        });
-    }
-});
+    // 不等待子进程
+    child.unref();
+    
+    runningProcesses.set(project, child);
+    return child;
+}
 
 // 项目启动路由
 app.post('/start/:project', (req, res) => {
@@ -163,8 +141,13 @@ app.post('/start/:project', (req, res) => {
     const { path: projectPath, command, nodeVersion } = config.projects[project];
     
     const child = exec(`node start-project.js ${project}`, {
-        maxBuffer: 1024 * 1024 // 增加缓冲区大小
+        maxBuffer: 1024 * 1024,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe']
     });
+
+    // 不等待子进程
+    child.unref();
 
     runningProcesses.set(project, child);
     let output = '';
@@ -201,6 +184,7 @@ app.post('/start/:project', (req, res) => {
         // 如果找到了URL，立即存储并返回响应
         if (urlsFound) {
             projectUrls.set(project, urls);
+            saveProjectStatus();  // 保存状态
             if (!res.headersSent) {
                 res.json({
                     status: 'success',
@@ -267,36 +251,152 @@ process.on('unhandledRejection', (reason, promise) => {
     process.exit(1);
 });
 
-const PORT = 3000;
+// 检查端口是否可用
+function isPortAvailable(port) {
+    return new Promise((resolve) => {
+        const server = require('net').createServer();
+        server.once('error', () => {
+            resolve(false);
+        });
+        server.once('listening', () => {
+            server.close();
+            resolve(true);
+        });
+        server.listen(port);
+    });
+}
+
+// 寻找可用端口
+async function findAvailablePort(startPort) {
+    let port = startPort;
+    while (!(await isPortAvailable(port))) {
+        port++;
+        if (port > startPort + 100) { // 最多尝试100个端口
+            throw new Error('无法找到可用端口');
+        }
+    }
+    return port;
+}
+
+const DEFAULT_PORT = 3000;
+// 清理状态文件
+function cleanupStatusFile() {
+    try {
+        if (fs.existsSync(statusFilePath)) {
+            fs.unlinkSync(statusFilePath);
+        }
+    } catch (error) {
+        console.error('Failed to cleanup status file:', error);
+    }
+}
+
+// 添加进程退出处理
+process.on('SIGINT', () => {
+    cleanupStatusFile();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    cleanupStatusFile();
+    process.exit(0);
+});
+
 // 添加 try-catch 来捕获启动错误
-try {
-    // console.log('Attempting to start server on port', PORT);
-    const server = app.listen(PORT, () => {
-        const url = `http://localhost:${PORT}/project-launcher.html`;
-        console.log('\x1b[32m%s\x1b[0m', '服务已启动！');
-        console.log('\x1b[32m%s\x1b[0m', `访问地址：${url}`);
+async function startServer() {
+    try {
+        // 清理之前的状态文件
+        cleanupStatusFile();
         
-        // 使用系统命令打开浏览器
-        setTimeout(() => {
-            const command = process.platform === 'win32' ? 
-                `start "" "${url}"` : 
-                process.platform === 'darwin' ? 
-                    `open "${url}"` : 
-                    `xdg-open "${url}"`;
+        // 寻找可用端口
+        const port = await findAvailablePort(DEFAULT_PORT);
+        
+        const server = app.listen(port, () => {
+            const url = `http://localhost:${port}/project-launcher.html`;
+            console.log('\x1b[32m%s\x1b[0m', '服务已启动！');
+            console.log('\x1b[32m%s\x1b[0m', `访问地址：${url}`);
             
-            exec(command, (error) => {
-                if (error) {
-                    console.error('\x1b[31m%s\x1b[0m', '打开浏览器失败：', error);
+            // 使用系统命令打开浏览器
+            setTimeout(() => {
+                const command = process.platform === 'win32' ? 
+                    `start "" "${url}"` : 
+                    process.platform === 'darwin' ? 
+                        `open "${url}"` : 
+                        `xdg-open "${url}"`;
+                
+                exec(command, (error) => {
+                    if (error) {
+                        console.error('\x1b[31m%s\x1b[0m', '打开浏览器失败：', error);
+                    }
+                });
+            }, 1000);
+        });
+
+        // 创建 WebSocket 服务器
+        const wss = new WebSocket.Server({ server });
+        
+        // 存储所有连接的客户端
+        const clients = new Set();
+
+        // 在进程退出时通知所有客户端
+        const notifyClientsOfShutdown = () => {
+            clients.forEach(client => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ type: 'shutdown' }));
                 }
             });
-        }, 1000);
-    });
+        };
 
-    server.on('error', (error) => {
-        console.error('\x1b[31m%s\x1b[0m', '服务器错误：', error);
+        // 设置进程退出处理
+        const handleExit = () => {
+            notifyClientsOfShutdown();
+            cleanupStatusFile();
+            // 给客户端一点时间处理关闭消息
+            setTimeout(() => {
+                process.exit(0);
+            }, 100);
+        };
+
+        process.on('SIGINT', handleExit);
+        process.on('SIGTERM', handleExit);
+
+        wss.on('connection', (ws) => {
+            // 添加新客户端
+            clients.add(ws);
+            console.log('WebSocket client connected');
+
+            // 发送初始状态
+            ws.send(JSON.stringify({ 
+                type: 'status', 
+                data: { 
+                    connected: true,
+                    projects: Array.from(runningProcesses.keys())
+                }
+            }));
+
+            ws.on('close', () => {
+                // 移除断开连接的客户端
+                clients.delete(ws);
+                console.log('WebSocket client disconnected');
+            });
+
+            ws.on('error', (error) => {
+                console.error('WebSocket error:', error);
+                clients.delete(ws);
+            });
+        });
+
+        server.on('error', (error) => {
+            console.error('\x1b[31m%s\x1b[0m', '服务器错误：', error);
+            process.exit(1);
+        });
+
+    } catch (error) {
+        console.error('\x1b[31m%s\x1b[0m', '启动失败：', error);
         process.exit(1);
-    });
-} catch (error) {
-    console.error('\x1b[31m%s\x1b[0m', '启动失败：', error);
-    process.exit(1);
+    }
 }
+
+// 在服务器启动时加载状态
+loadProjectStatus();
+
+startServer();

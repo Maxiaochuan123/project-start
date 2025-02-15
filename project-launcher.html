@@ -21,6 +21,14 @@
             background-color: #f0f2f5;
             margin: 0;
             min-height: 100vh;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
         }
 
         h1 {
@@ -36,6 +44,7 @@
             flex-wrap: wrap;
             justify-content: center;
             max-width: 800px;
+            width: 100%;
         }
 
         .project-card {
@@ -49,7 +58,6 @@
         }
 
         .project-card:hover {
-            transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(0,0,0,0.15);
         }
 
@@ -142,7 +150,7 @@
         }
 
         .status {
-            margin-top: 30px;
+            margin: 30px 0;
             padding: 15px 25px;
             border-radius: 8px;
             font-size: 16px;
@@ -320,34 +328,6 @@
             }
         }
 
-        // 轮询项目状态
-        async function startStatusPolling(projectId) {
-            const pollInterval = setInterval(async () => {
-                try {
-                    const response = await fetch(`/status/${projectId}`, {
-                        headers: {
-                            'Accept': 'application/json'
-                        },
-                        credentials: 'same-origin'
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to get project status');
-                    }
-
-                    const { running, urls } = await response.json();
-                    updateProjectStatus(projectId, running, urls);
-                    
-                    if (!running) {
-                        // 项目已停止运行，停止轮询
-                        clearInterval(pollInterval);
-                    }
-                } catch (error) {
-                    console.error('Status polling error:', error);
-                }
-            }, 5000); // 每5秒检查一次
-        }
-
         // 切换项目状态（启动/停止）
         async function toggleProject(projectId) {
             const statusDiv = document.getElementById('status');
@@ -388,11 +368,6 @@
                 
                 // 更新项目状态
                 updateProjectStatus(projectId, !isRunning, data.urls);
-
-                // 如果是启动项目，开始轮询状态
-                if (!isRunning) {
-                    startStatusPolling(projectId);
-                }
             } catch (error) {
                 statusDiv.textContent = `Error: ${error.message}`;
                 statusDiv.className = 'status error visible';
@@ -414,21 +389,120 @@
         }
 
         // 页面加载时获取项目列表
-        document.addEventListener('DOMContentLoaded', loadProjects);
+        document.addEventListener('DOMContentLoaded', () => {
+            loadProjects();
+            // 建立 WebSocket 连接
+            setupWebSocket();
+        });
+
+        // 设置 WebSocket 连接
+        function setupWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(`${protocol}//${window.location.host}`);
+            let reconnectTimeout;
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                showServerStatus('Connected to server', 'success');
+                // 清除重连定时器
+                if (reconnectTimeout) {
+                    clearTimeout(reconnectTimeout);
+                    reconnectTimeout = null;
+                }
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                console.log('Received message:', message);
+
+                switch (message.type) {
+                    case 'status':
+                        if (message.data.connected) {
+                            showServerStatus('Connected to server', 'success');
+                            // 如果服务器发送了项目状态，更新UI
+                            if (message.data.projects) {
+                                message.data.projects.forEach(projectId => {
+                                    checkProjectStatus(projectId);
+                                });
+                            }
+                        }
+                        break;
+                    case 'shutdown':
+                        console.log('Server is shutting down');
+                        resetAllProjects();
+                        showServerStatus('Server is shutting down', 'error');
+                        break;
+                    default:
+                        console.log('Unknown message type:', message.type);
+                }
+            };
+
+            ws.onclose = (event) => {
+                console.log('WebSocket disconnected', event.code, event.reason);
+                resetAllProjects();
+                showServerStatus('Disconnected from server', 'error');
+                
+                // 尝试重新连接
+                if (!reconnectTimeout) {
+                    reconnectTimeout = setTimeout(() => {
+                        console.log('Attempting to reconnect...');
+                        setupWebSocket();
+                    }, 5000);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                showServerStatus('Connection error', 'error');
+            };
+
+            // 存储 WebSocket 实例以便清理
+            window.projectLauncherWS = ws;
+        }
+
+        // 显示服务器状态消息
+        function showServerStatus(message, type) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${type} visible`;
+            
+            // 只有成功消息5秒后自动隐藏
+            if (type === 'success') {
+                setTimeout(() => {
+                    if (statusDiv.textContent === message) {
+                        statusDiv.className = 'status';
+                    }
+                }, 5000);
+            }
+        }
+
+        // 重置所有项目状态为未启动
+        function resetAllProjects() {
+            const projectCards = document.querySelectorAll('.project-card');
+            projectCards.forEach(card => {
+                const button = card.querySelector('button');
+                const buttonText = button.querySelector('.button-text');
+                const statusDiv = card.querySelector('.project-status');
+                const projectUrls = card.querySelector('.project-urls');
+                const localUrl = card.querySelector('.local-url');
+                const networkUrl = card.querySelector('.network-url');
+
+                button.classList.remove('running');
+                buttonText.textContent = 'Start Project';
+                statusDiv.textContent = 'Stopped';
+                statusDiv.classList.remove('running');
+                projectUrls.style.display = 'none';
+                localUrl.href = '#';
+                localUrl.textContent = '';
+                networkUrl.href = '#';
+                networkUrl.textContent = '';
+            });
+        }
 
         // 添加页面关闭事件处理
-        window.addEventListener('unload', () => {
-            // 获取所有运行中的项目
-            const runningProjects = Array.from(document.querySelectorAll('.project-card'))
-                .filter(card => card.querySelector('button').classList.contains('running'))
-                .map(card => card.dataset.projectId);
-
-            // 如果有运行中的项目，停止它们
-            if (runningProjects.length > 0) {
-                // 使用 sendBeacon 发送请求，这样在页面关闭时也能确保请求发送完成
-                runningProjects.forEach(projectId => {
-                    navigator.sendBeacon(`/stop/${projectId}`, JSON.stringify({}));
-                });
+        window.addEventListener('beforeunload', () => {
+            if (window.projectLauncherWS) {
+                window.projectLauncherWS.close();
             }
         });
 

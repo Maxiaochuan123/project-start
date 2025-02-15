@@ -22,7 +22,13 @@ function startProject(projectPath, command, nodeVersion) {
     // 创建 Node.js 版本切换批处理文件
     const nvmBatchFile = path.join(process.cwd(), `nvm_switch_${Date.now()}.bat`);
     const nvmBatchContent = `@echo off
-start "NVM Switcher" /wait cmd /c "nvm use ${nodeVersion}"
+set "PATH=%PATH%;%APPDATA%\\nvm;%ProgramFiles%\\nodejs"
+for /f "tokens=*" %%i in ('"%SystemRoot%\\System32\\cmd.exe" /c "nvm current"') do set current=%%i
+echo Current version: %current% | findstr "${nodeVersion}" > nul
+if %errorlevel% equ 0 (
+    exit 0
+)
+start "NVM Switcher" /wait "%SystemRoot%\\System32\\cmd.exe" /c "nvm use ${nodeVersion}"
 `;
     fs.writeFileSync(nvmBatchFile, nvmBatchContent);
 

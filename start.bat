@@ -3,7 +3,7 @@ title Server
 color 07
 
 :: 设置默认的 Node.js 版本（使用最新版本）
-call nvm use 22.12.0
+call nvm use 18.20.4
 
 echo Starting server...
 node server.js

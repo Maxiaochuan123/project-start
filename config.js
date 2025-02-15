@@ -5,28 +5,28 @@ module.exports = {
             command: 'pnpm dev',
             name: '广告平台 Web',
             description: '',
-            nodeVersion: '22.12.0'
+            nodeVersion: '18.20.4'
         },
         admin: {
             path: 'PC-admin-web',
             command: 'pnpm dev',
             name: 'Admin Web',
             description: '',
-            nodeVersion: '22.12.0'
+            nodeVersion: '18.20.4'
         },
         creator: {
             path: 'PC-web',
             command: 'npm run serve',
             name: '创作者中心 Web',
             description: '',
-            nodeVersion: '16.20.2'
+            nodeVersion: '18.20.4'
         },
         activity: {
             path: 'h5-activity-page',
             command: 'pnpm dev',
             name: '活动中心 H5',
             description: '',
-            nodeVersion: '22.12.0'
+            nodeVersion: '18.20.4'
         }
     }
 }; 
