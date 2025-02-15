@@ -3,25 +3,25 @@ const path = require('path');
 const fs = require('fs');
 const config = require('./config');
 
-function startProject(projectPath, command, nodeVersion) {
-    // 首先尝试在当前目录查找项目
-    const currentDirPath = path.join(process.cwd(), projectPath);
-    // 如果当前目录不存在，则尝试桌面路径
-    const desktopPath = path.join(process.env.USERPROFILE, 'Desktop');
-    const desktopFullPath = path.join(desktopPath, projectPath);
-    
-    // 确定实际的项目路径
-    const fullPath = fs.existsSync(currentDirPath) ? currentDirPath : 
-                    fs.existsSync(desktopFullPath) ? desktopFullPath : null;
-    
-    if (!fullPath) {
-        const error = `Project path not found in current directory or desktop: ${projectPath}`;
-        throw new Error(error);
-    }
+async function startProject(projectPath, command, nodeVersion) {
+    try {
+        // 首先尝试在当前目录查找项目
+        const currentDirPath = path.join(process.cwd(), projectPath);
+        // 如果当前目录不存在，则尝试桌面路径
+        const desktopPath = path.join(process.env.USERPROFILE, 'Desktop');
+        const desktopFullPath = path.join(desktopPath, projectPath);
+        
+        // 确定实际的项目路径
+        const fullPath = fs.existsSync(currentDirPath) ? currentDirPath : 
+                        fs.existsSync(desktopFullPath) ? desktopFullPath : null;
+        
+        if (!fullPath) {
+            throw new Error(`Project path not found: ${projectPath}`);
+        }
 
-    // 创建 Node.js 版本切换批处理文件
-    const nvmBatchFile = path.join(process.cwd(), `nvm_switch_${Date.now()}.bat`);
-    const nvmBatchContent = `@echo off
+        // 创建临时的 nvm 切换脚本
+        const nvmBatchFile = path.join(process.cwd(), `nvm_switch_${Date.now()}.bat`);
+        const nvmBatchContent = `@echo off
 set "PATH=%PATH%;%APPDATA%\\nvm;%ProgramFiles%\\nodejs"
 for /f "tokens=*" %%i in ('"%SystemRoot%\\System32\\cmd.exe" /c "nvm current"') do set current=%%i
 echo Current version: %current% | findstr "${nodeVersion}" > nul
@@ -30,78 +30,62 @@ if %errorlevel% equ 0 (
 )
 start "NVM Switcher" /wait "%SystemRoot%\\System32\\cmd.exe" /c "nvm use ${nodeVersion}"
 `;
-    fs.writeFileSync(nvmBatchFile, nvmBatchContent);
+        fs.writeFileSync(nvmBatchFile, nvmBatchContent);
 
-    // 先执行 Node.js 版本切换
-    exec(nvmBatchFile, (error, stdout, stderr) => {
-        // 清理 nvm 切换批处理文件
-        try {
-            fs.unlinkSync(nvmBatchFile);
-        } catch (err) {}
+        // 执行 Node.js 版本切换
+        await new Promise((resolve, reject) => {
+            exec(nvmBatchFile, (error, stdout, stderr) => {
+                try {
+                    fs.unlinkSync(nvmBatchFile);
+                } catch (err) {
+                    console.error('Failed to cleanup nvm batch file:', err);
+                }
 
-        if (error) {
-            console.error(`Failed to switch Node version: ${error}`);
-            return;
-        }
-
-        // 版本切换成功后，启动项目
-        const child = exec(command, {
-            cwd: fullPath,
-            env: { ...process.env, FORCE_COLOR: true }
+                if (error) {
+                    reject(new Error(`Failed to switch Node version: ${error.message}`));
+                    return;
+                }
+                resolve();
+            });
         });
 
-        // 用于存储项目URL的变量
+        // 启动项目，不使用 detached 模式
+        const child = exec(command, {
+            cwd: fullPath,
+            env: { ...process.env, FORCE_COLOR: true },
+            windowsHide: true, // 在 Windows 上隐藏命令提示符窗口
+            shell: true // 使用 shell 执行命令
+        });
+
         let projectUrl = null;
-        // 存储完整的输出用于多行匹配
         let fullOutput = '';
 
         child.stdout.on('data', (data) => {
             const output = data.toString();
-            // 输出到控制台
             process.stdout.write(data);
-            
-            // 追加到完整输出
             fullOutput += output;
 
             // 检测开发服务器URL模式
             const patterns = [
-                // Vue CLI 标准输出格式
                 /\s+- Local:\s+(http:\/\/localhost:[0-9]+\/)/,
-                // 备用格式
                 /App running at:\s*[\r\n]+\s+- Local:\s+(http:\/\/localhost:[0-9]+\/)/,
                 /Your application is running here: (http:\/\/localhost:[0-9]+)/
             ];
 
-            // 如果还没有找到URL
             if (!projectUrl) {
-                // 首先尝试从当前输出行匹配
                 for (const pattern of patterns) {
-                    const match = output.match(pattern);
+                    const match = output.match(pattern) || fullOutput.match(pattern);
                     if (match) {
                         projectUrl = match[1].trim();
+                        // 写入状态文件
+                        const statusFile = path.join(process.cwd(), 'server_status.txt');
+                        fs.writeFileSync(statusFile, JSON.stringify({
+                            project,
+                            url: projectUrl,
+                            status: 'running'
+                        }));
                         break;
                     }
-                }
-
-                // 如果当前行没找到，尝试从累积的输出中匹配
-                if (!projectUrl) {
-                    for (const pattern of patterns) {
-                        const match = fullOutput.match(pattern);
-                        if (match) {
-                            projectUrl = match[1].trim();
-                            break;
-                        }
-                    }
-                }
-
-                // 如果找到了URL，写入状态文件
-                if (projectUrl) {
-                    const statusFile = path.join(process.cwd(), 'server_status.txt');
-                    fs.writeFileSync(statusFile, JSON.stringify({
-                        project,
-                        url: projectUrl,
-                        status: 'running'
-                    }));
                 }
             }
         });
@@ -111,25 +95,44 @@ start "NVM Switcher" /wait "%SystemRoot%\\System32\\cmd.exe" /c "nvm use ${nodeV
         });
 
         child.on('error', (error) => {
+            console.error(`Project startup error: ${error.message}`);
+            process.exit(1);
         });
 
         child.on('exit', (code) => {
+            if (code !== 0) {
+                console.error(`Project exited with code ${code}`);
+            }
             // 清理状态文件
             try {
                 fs.unlinkSync(path.join(process.cwd(), 'server_status.txt'));
-            } catch (err) {}
+            } catch (err) {
+                console.error('Failed to cleanup status file:', err);
+            }
+            process.exit(code || 0);
         });
 
         return child;
-    });
+    } catch (error) {
+        console.error(`Failed to start project: ${error.message}`);
+        process.exit(1);
+    }
 }
 
-// 获取命令行参数
+// 获取命令行参数并启动项目
 const project = process.argv[2];
+if (!project) {
+    console.error('Project name is required');
+    process.exit(1);
+}
 
 if (config.projects[project]) {
     const { path: projectPath, command, nodeVersion } = config.projects[project];
-    startProject(projectPath, command, nodeVersion);
+    startProject(projectPath, command, nodeVersion).catch(error => {
+        console.error(error);
+        process.exit(1);
+    });
 } else {
-    console.log('Available projects:', Object.keys(config.projects).join(', '));
+    console.error('Available projects:', Object.keys(config.projects).join(', '));
+    process.exit(1);
 }

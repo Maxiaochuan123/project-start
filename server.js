@@ -109,12 +109,9 @@ function startProjectProcess(project, command, cwd) {
     const child = exec(command, {
         cwd,
         env: { ...process.env, FORCE_COLOR: true },
-        detached: true, // 使子进程独立运行
-        stdio: 'ignore' // 忽略标准输入输出
+        windowsHide: true, // 在 Windows 上隐藏命令提示符窗口
+        shell: true // 使用 shell 执行命令
     });
-    
-    // 不等待子进程
-    child.unref();
     
     runningProcesses.set(project, child);
     return child;
@@ -140,15 +137,17 @@ app.post('/start/:project', (req, res) => {
 
     const { path: projectPath, command, nodeVersion } = config.projects[project];
     
+    // 修改启动命令的执行方式
     const child = exec(`node start-project.js ${project}`, {
         maxBuffer: 1024 * 1024,
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe']
+        windowsHide: true, // 在 Windows 上隐藏命令提示符窗口
+        shell: true // 使用 shell 执行命令
     });
 
-    // 不等待子进程
-    child.unref();
-
+    // 存储启动时间和进程组ID
+    child.startTime = Date.now();
+    child.processGroup = process.platform === 'win32' ? child.pid : -child.pid;
+    
     runningProcesses.set(project, child);
     let output = '';
     let error = '';
@@ -233,6 +232,156 @@ app.get('/status/:project', (req, res) => {
     });
 });
 
+// 停止项目
+app.post('/stop/:project', (req, res) => {
+    const { project } = req.params;
+    
+    if (!config.projects[project]) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'Invalid project name'
+        });
+    }
+
+    const process = runningProcesses.get(project);
+    if (!process) {
+        return res.json({
+            status: 'success',
+            message: 'Project is not running'
+        });
+    }
+
+    try {
+        // 在 Windows 上，使用多种方式确保进程被终止
+        if (process.platform === 'win32') {
+            // 首先获取项目的 URL 来提取端口
+            const urls = projectUrls.get(project);
+            if (urls && urls.local) {
+                const port = urls.local.match(/:(\d+)/)[1];
+
+                // 1. 使用 tasklist 找到所有 node.exe 进程
+                exec('tasklist /FI "IMAGENAME eq node.exe" /FO CSV /NH', (error, stdout) => {
+                    if (!error) {
+                        const lines = stdout.split('\n');
+                        const nodePids = [];
+                        
+                        // 解析 tasklist 输出
+                        lines.forEach(line => {
+                            const match = line.match(/"([^"]+)"/g);
+                            if (match && match.length >= 2) {
+                                const pid = match[1].replace(/"/g, '');
+                                nodePids.push(pid);
+                            }
+                        });
+
+                        // 对每个 node 进程，检查其命令行
+                        nodePids.forEach(pid => {
+                            exec(`wmic process where "ProcessId=${pid}" get CommandLine /format:list`, (error, stdout) => {
+                                if (!error && stdout.includes(project)) {
+                                    // 如果命令行包含项目名，终止该进程
+                                    exec(`taskkill /F /T /PID ${pid}`, (error) => {
+                                        if (error) {
+                                            console.error(`Failed to kill process ${pid}: ${error.message}`);
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
+                });
+
+                // 2. 终止占用端口的进程
+                exec(`for /f "tokens=5" %a in ('netstat -aon ^| find ":${port}"') do taskkill /F /T /PID %a`, (error) => {
+                    if (error) {
+                        console.error(`Failed to kill process on port ${port}: ${error.message}`);
+                    }
+                });
+
+                // 3. 使用 process tree 终止
+                exec(`wmic process where "ParentProcessId=${process.pid}" get ProcessId /format:list`, (error, stdout) => {
+                    if (!error) {
+                        const childPids = stdout.match(/ProcessId=(\d+)/g);
+                        if (childPids) {
+                            childPids.forEach(pidMatch => {
+                                const pid = pidMatch.replace('ProcessId=', '');
+                                exec(`taskkill /F /T /PID ${pid}`, (error) => {
+                                    if (error) {
+                                        console.error(`Failed to kill child process ${pid}: ${error.message}`);
+                                    }
+                                });
+                            });
+                        }
+                    }
+                });
+            }
+
+            // 4. 终止主进程
+            exec(`taskkill /F /T /PID ${process.pid}`, (error) => {
+                if (error) {
+                    console.error(`Failed to kill main process: ${error.message}`);
+                }
+            });
+
+            // 清理状态
+            runningProcesses.delete(project);
+            projectUrls.delete(project);
+            saveProjectStatus();
+
+            // 延迟返回响应，确保进程有时间被终止
+            setTimeout(() => {
+                // 再次检查端口是否被释放
+                const net = require('net');
+                const testServer = net.createServer();
+                const port = urls.local.match(/:(\d+)/)[1];
+
+                testServer.once('error', () => {
+                    // 端口仍然被占用，再次尝试终止进程
+                    exec(`for /f "tokens=5" %a in ('netstat -aon ^| find ":${port}"') do taskkill /F /T /PID %a`);
+                });
+
+                testServer.once('listening', () => {
+                    testServer.close();
+                });
+
+                testServer.listen(port);
+
+                res.json({
+                    status: 'success',
+                    message: 'Project stopped successfully'
+                });
+            }, 3000); // 增加延迟时间到 3 秒
+        } else {
+            // 在 Unix 系统上使用进程组 ID 终止整个进程树
+            try {
+                process.kill(-process.processGroup, 'SIGKILL');
+            } catch (error) {
+                console.error(`Failed to kill process group: ${error.message}`);
+            }
+            
+            runningProcesses.delete(project);
+            projectUrls.delete(project);
+            saveProjectStatus();
+            
+            setTimeout(() => {
+                res.json({
+                    status: 'success',
+                    message: 'Project stopped successfully'
+                });
+            }, 3000);
+        }
+    } catch (error) {
+        console.error(`Error stopping project: ${error.message}`);
+        runningProcesses.delete(project);
+        projectUrls.delete(project);
+        saveProjectStatus();
+        
+        res.status(500).json({
+            status: 'error',
+            message: `Failed to stop project: ${error.message}`
+        });
+    }
+});
+
 // 错误处理中间件
 app.use((err, req, res, next) => {
     if (!res.headersSent) {
@@ -290,17 +439,6 @@ function cleanupStatusFile() {
     }
 }
 
-// 添加进程退出处理
-process.on('SIGINT', () => {
-    cleanupStatusFile();
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    cleanupStatusFile();
-    process.exit(0);
-});
-
 // 添加 try-catch 来捕获启动错误
 async function startServer() {
     try {
@@ -346,8 +484,9 @@ async function startServer() {
             });
         };
 
-        // 设置进程退出处理
-        const handleExit = () => {
+        // 统一的进程退出处理
+        const handleExit = (signal) => {
+            console.log(`Received ${signal}, shutting down...`);
             notifyClientsOfShutdown();
             cleanupStatusFile();
             // 给客户端一点时间处理关闭消息
@@ -356,15 +495,15 @@ async function startServer() {
             }, 100);
         };
 
-        process.on('SIGINT', handleExit);
-        process.on('SIGTERM', handleExit);
+        // 注册进程退出处理器
+        ['SIGINT', 'SIGTERM'].forEach(signal => {
+            process.on(signal, () => handleExit(signal));
+        });
 
         wss.on('connection', (ws) => {
-            // 添加新客户端
             clients.add(ws);
             console.log('WebSocket client connected');
 
-            // 发送初始状态
             ws.send(JSON.stringify({ 
                 type: 'status', 
                 data: { 
@@ -374,7 +513,6 @@ async function startServer() {
             }));
 
             ws.on('close', () => {
-                // 移除断开连接的客户端
                 clients.delete(ws);
                 console.log('WebSocket client disconnected');
             });
